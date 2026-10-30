@@ -12,9 +12,28 @@ interface LocalStoreData {
 }
 
 /**
+ * In-memory serverless runtime cache (safe across warm invocations).
+ * Short TTL (1.5s) prevents stale reads across concurrent instances.
+ */
+interface CacheEntry {
+  room: InternalRoom;
+  version: number;
+  cachedAt: number;
+}
+const memoryCache = new Map<string, CacheEntry>();
+const CACHE_TTL_MS = 1500;
+
+/**
+ * Check if the runtime is Netlify Production (or AWS Lambda).
+ */
+export function isProductionEnvironment(): boolean {
+  return process.env.NETLIFY === 'true' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+}
+
+/**
  * Check if Netlify Blobs runtime environment is available.
  */
-function isNetlifyBlobsAvailable(): boolean {
+export function isNetlifyBlobsAvailable(): boolean {
   if (typeof globalThis.netlifyBlobsContext !== 'undefined') return true;
   if (process.env.NETLIFY_BLOBS_CONTEXT) return true;
   if (process.env.NETLIFY_SITE_ID && process.env.NETLIFY_BLOBS_TOKEN) return true;
@@ -72,20 +91,38 @@ export class RoomStorage {
   static async getRoom(roomCode: string): Promise<{ room: InternalRoom | null; version?: number }> {
     const key = `room_${roomCode.toUpperCase()}`;
 
+    // 1. Check warm serverless memory cache first
+    const cached = memoryCache.get(key);
+    if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
+      return { room: cached.room, version: cached.version };
+    }
+
+    // 2. Fetch from Netlify Blobs if context is available
     if (isNetlifyBlobsAvailable()) {
       try {
         const store = getNetlifyStore();
         const res = await store.getWithMetadata(key, { consistency: 'strong', type: 'json' });
-        if (!res || !res.data) return { room: null };
+        if (!res || !res.data) {
+          memoryCache.delete(key);
+          return { room: null };
+        }
         const room = res.data as InternalRoom;
         const version = typeof res.metadata?.version === 'number' ? res.metadata.version : room.version;
+        memoryCache.set(key, { room, version, cachedAt: Date.now() });
         return { room, version };
       } catch (err) {
-        console.error('Netlify Blobs getRoom error, falling back to local:', err);
+        console.error('Netlify Blobs getRoom error:', err);
+        // In production, do NOT read from local disk
+        if (isProductionEnvironment()) {
+          return { room: null };
+        }
       }
+    } else if (isProductionEnvironment()) {
+      // In production, if Blobs is not available, do NOT read from local disk
+      return { room: null };
     }
 
-    // Local fallback
+    // 3. Local fallback (only for local development & unit test runs)
     const local = readLocalStore();
     const entry = local.rooms[key];
     if (!entry) return { room: null };
@@ -141,13 +178,29 @@ export class RoomStorage {
         if (options?.onlyIfNew && writeRes && 'modified' in writeRes && writeRes.modified === false) {
           return { success: false, error: 'Room code already exists' };
         }
+
+        // Keep local memory cache synchronized
+        memoryCache.set(key, { room: roomToSave, version: nextVersion, cachedAt: Date.now() });
         return { success: true };
       } catch (err) {
-        console.error('Netlify Blobs saveRoom error, falling back to local:', err);
+        console.error('Netlify Blobs saveRoom error:', err);
+        // In production, fail explicitly. NEVER silently fall back to local read-only disk!
+        if (isProductionEnvironment()) {
+          return {
+            success: false,
+            error: `Production storage failure: ${err instanceof Error ? err.message : 'Unable to persist to Netlify Blobs'}`,
+          };
+        }
       }
+    } else if (isProductionEnvironment()) {
+      // In production without Blobs, fail explicitly
+      return {
+        success: false,
+        error: 'Production cloud storage is not available. Netlify Blobs must be initialized.',
+      };
     }
 
-    // Local persistent storage with conditional concurrency handling
+    // Local persistent storage (only for local development and unit tests)
     const local = readLocalStore();
     const existing = local.rooms[key];
 
@@ -167,6 +220,7 @@ export class RoomStorage {
       updatedAt: roomToSave.updatedAt,
     };
     writeLocalStore(local);
+    memoryCache.set(key, { room: roomToSave, version: nextVersion, cachedAt: Date.now() });
     return { success: true };
   }
 
@@ -175,14 +229,23 @@ export class RoomStorage {
    */
   static async deleteRoom(roomCode: string): Promise<boolean> {
     const key = `room_${roomCode.toUpperCase()}`;
+    memoryCache.delete(key);
 
     if (isNetlifyBlobsAvailable()) {
       try {
         const store = getNetlifyStore();
         await store.delete(key);
+        if (isProductionEnvironment()) {
+          return true;
+        }
       } catch (err) {
         console.error('Netlify Blobs deleteRoom error:', err);
+        if (isProductionEnvironment()) {
+          return false;
+        }
       }
+    } else if (isProductionEnvironment()) {
+      return false;
     }
 
     const local = readLocalStore();

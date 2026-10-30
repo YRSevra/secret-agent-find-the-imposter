@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "test": "npm run test:phase3 && npm run test:phase4 && npm run test:phase5 && npm run test:phase6 && npm run test:phase7 && npm run test:phase8 && npm run test:phase9 && npm run test:phase10 && npm run test:phase11",
+    "test": "npm run test:storage && npm run test:phase3 && npm run test:phase4 && npm run test:phase5 && npm run test:phase6 && npm run test:phase7 && npm run test:phase8 && npm run test:phase9 && npm run test:phase10 && npm run test:phase11",
+    "test:storage": "tsx src/server/storageFixTest.ts",
     "test:phase3": "tsx src/server/phase3Test.ts",
     "test:phase4": "tsx src/server/phase4Test.ts",
     "test:phase5": "tsx src/server/phase5Test.ts",

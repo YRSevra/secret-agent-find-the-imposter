@@ -1,4 +1,5 @@
 import type { Handler } from '@netlify/functions';
+import { connectLambda } from '@netlify/blobs';
 import { RoomManager } from '../../src/server/roomManager';
 import { GameApiRequest } from '../../src/types/game';
 
@@ -15,6 +16,34 @@ export const handler: Handler = async (event) => {
       statusCode: 204,
       headers: HEADERS,
       body: '',
+    };
+  }
+
+  // 1. Initialize Netlify Blobs Lambda context from the execution event
+  const lambdaEvent = event as unknown as { blobs?: string; headers: Record<string, string> };
+  if (lambdaEvent.blobs) {
+    try {
+      connectLambda({ blobs: lambdaEvent.blobs, headers: lambdaEvent.headers || {} });
+    } catch (err) {
+      console.error('[CRITICAL] Netlify Blobs connectLambda failed:', err);
+    }
+  }
+
+  // Check if running on Netlify production where Blobs context is required
+  const isNetlifyProduction = process.env.NETLIFY === 'true' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+  const isBlobsConfigured =
+    typeof globalThis.netlifyBlobsContext !== 'undefined' || Boolean(process.env.NETLIFY_BLOBS_CONTEXT);
+
+  if (isNetlifyProduction && !isBlobsConfigured) {
+    console.error('[CRITICAL] Netlify production environment detected without active Blobs context.');
+    return {
+      statusCode: 503,
+      headers: HEADERS,
+      body: JSON.stringify({
+        success: false,
+        error: 'Agency cloud storage subsystem unavailable. Netlify Blobs context failed to initialize.',
+        code: 'STORAGE_UNAVAILABLE',
+      }),
     };
   }
 
@@ -38,6 +67,7 @@ export const handler: Handler = async (event) => {
     if (!response.success) {
       if (response.code === 'ROOM_NOT_FOUND') statusCode = 404;
       else if (response.code === 'UNAUTHORIZED') statusCode = 401;
+      else if (response.code === 'STORAGE_UNAVAILABLE') statusCode = 503;
       else statusCode = 400;
     }
 

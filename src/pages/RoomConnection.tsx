@@ -53,9 +53,11 @@ export const RoomConnection: React.FC = () => {
       const res = await GameApiService.getRoom(code);
       if (!res.success || !res.data) {
         consecutiveFailuresRef.current++;
-        if (consecutiveFailuresRef.current >= 3) {
+        // If room is explicitly not found (404) or failed repeatedly, terminate loading state and display error
+        if (res.code === 'ROOM_NOT_FOUND' || consecutiveFailuresRef.current >= 2) {
           setNetworkStatus('error');
-          setActionError(res.error || 'Connection to agency server lost.');
+          setActionError(res.error || 'Unable to locate specified mission room in agency records.');
+          setIsLoading(false);
         } else {
           setNetworkStatus('reconnecting');
         }
@@ -114,7 +116,13 @@ export const RoomConnection: React.FC = () => {
       setIsLoading(false);
     } catch {
       consecutiveFailuresRef.current++;
-      setNetworkStatus(consecutiveFailuresRef.current >= 3 ? 'error' : 'reconnecting');
+      if (consecutiveFailuresRef.current >= 2) {
+        setNetworkStatus('error');
+        setActionError('Network transmission failure. Unable to contact agency server.');
+        setIsLoading(false);
+      } else {
+        setNetworkStatus('reconnecting');
+      }
     }
   }, [code, room, navigate]);
 

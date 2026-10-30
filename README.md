@@ -30,20 +30,22 @@
 
 ## 3. Technology Stack
 
-### Frontend Foundation (Current)
+### Frontend Architecture
 - **Framework**: [React 18](https://react.dev/)
 - **Language**: [TypeScript](https://www.typescriptlang.org/) (Strict Mode)
 - **Build Tool**: [Vite](https://vitejs.dev/)
 - **Styling**: [Tailwind CSS](https://tailwindcss.com/) with custom Classified Agency theme tokens
 - **Icons**: [Lucide React](https://lucide.dev/)
 - **Routing**: [React Router DOM v6](https://reactrouter.com/)
+- **Audio Engine**: Web Audio API synthesized procedural SFX
 - **Code Quality**: ESLint 9 (Flat Config) & Prettier-aligned linting
 
-### Planned Backend Architecture (Future Phases)
-- **Serverless API**: Netlify Functions (`/.netlify/functions/game`)
-- **Persistence & State**: Netlify Blobs with server-authoritative state
-- **Consistency**: Strong consistency model with optimistic concurrency / conditional writes
-- **Synchronization**: Polling / lightweight real-time synchronization
+### Serverless Backend & Cloud Storage
+- **Serverless API**: Netlify Functions (`/.netlify/functions/game`) powered by `@netlify/functions` and `@netlify/blobs`
+- **Cloud Persistence**: Netlify Blobs (`secret-agent-rooms` store) with strong consistency (`consistency: 'strong'`)
+- **Lambda Compatibility**: Automatic context initialization via `connectLambda(event)` for seamless zero-config cloud storage
+- **Concurrency & Integrity**: Server-authoritative state transitions with version-incremented conditional writes
+- **Local Fallback**: Local JSON persistence (`.netlify/blobs-local/rooms.json`) for offline development and local automated testing
 
 ---
 
@@ -59,29 +61,36 @@ MULTIPLAYER_GAME/
 │   └── logo.svg             # Classified agency insignia
 │
 ├── src/
-│   ├── assets/              # Bundled assets (SVGs, graphics)
-│   ├── components/          # Reusable UI building blocks
-│   ├── pages/               # Top-level view routes
-│   ├── hooks/               # Custom React hooks
-│   ├── services/            # API & state sync client services
-│   ├── utils/               # Pure helper functions & formatters
-│   ├── types/               # TypeScript interfaces & types
-│   ├── constants/           # Game rules & configuration constants
-│   ├── styles/              # Global & specialized CSS stylesheets
-│   │
-│   ├── App.tsx              # Application shell
+│   ├── components/          # Reusable UI building blocks (Buttons, Modals, Cards, Avatars)
+│   ├── pages/               # Top-level routes (Home, Connection, RoleReveal, Discussion, Voting, etc.)
+│   ├── services/            # Client API services (`GameApiService` communicating with Netlify Function)
+│   ├── server/              # Server-authoritative logic & storage
+│   │   ├── roomManager.ts         # Room creation, joining, capacity & session tokens
+│   │   ├── storage.ts             # Netlify Blobs strong-consistency persistence adapter
+│   │   ├── roleAssignment.ts      # Cryptographic secret role & word assignment
+│   │   ├── discussionManager.ts   # Interrogation turns & encrypted chat comms
+│   │   ├── votingManager.ts       # Secret ballot voting, ties & second-tie elimination
+│   │   ├── scoreManager.ts        # Tournament scoring engine
+│   │   ├── rematchManager.ts      # Rematch states, history archive & host transfers
+│   │   ├── finalResultsManager.ts # Leaderboard ranking & tactical merit calculation
+│   │   └── security.ts            # Sanitization & token generation
+│   ├── types/               # TypeScript data models, contracts & API payloads
+│   ├── constants/           # Secret word banks, avatars, and configuration
+│   ├── styles/              # Global & tactical design system CSS stylesheets
+│   ├── App.tsx              # Application shell & route switchers
 │   ├── main.tsx             # Application DOM entry point
 │   └── index.css            # Tailwind directives & base styles
 │
 ├── netlify/
-│   └── functions/           # Netlify serverless functions (Future)
+│   └── functions/
+│       └── game.ts          # Serverless entrypoint invoking `connectLambda` & `RoomManager`
 │
-├── package.json             # Dependencies and build scripts
+├── netlify.toml             # Build commands, functions config, & SPA rewrite rules
+├── package.json             # Dependencies and build/test scripts
 ├── package-lock.json        # Deterministic dependency lockfile
 ├── tsconfig.json            # Strict TypeScript configuration
-├── vite.config.ts           # Vite bundler configuration & aliases
+├── vite.config.ts           # Vite bundler configuration & proxies
 ├── tailwind.config.js       # Classified Agency color theme
-├── postcss.config.js        # PostCSS pipeline
 ├── eslint.config.js         # ESLint configuration
 ├── index.html               # HTML entry point
 ├── .gitignore               # Ignored version-control artifacts

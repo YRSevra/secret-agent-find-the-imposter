@@ -2,13 +2,20 @@
  * Production Multiplayer Fix Verification Test Suite
  *
  * Verifies:
- * 1. Netlify Blobs Lambda initialization via connectLambda.
- * 2. Production storage error handling (no silent local fallbacks when persistence fails).
- * 3. Safe in-memory runtime caching behavior.
- * 4. Error response codes (ROOM_NOT_FOUND, STORAGE_UNAVAILABLE) that resolve frontend loading states.
+ * 1. Missing production credentials rejection (returns clear configuration error, no silent fallback).
+ * 2. Strong-consistency Netlify Blobs API access configuration (edgeAccess: false, origin-backed).
+ * 3. Room creation and duplicate room-code rejection (atomic onlyIfNew).
+ * 4. Concurrent room updates and stale-version rejection (optimistic concurrency / ETag checks).
+ * 5. Room reads immediately after writes (authoritative fresh state, no stale cache).
+ * 6. Local development compatibility without requiring credentials.
  */
 
-import { RoomStorage, isProductionEnvironment, isNetlifyBlobsAvailable } from './storage';
+import {
+  RoomStorage,
+  isProductionEnvironment,
+  isNetlifyBlobsAvailable,
+  getNetlifyStore,
+} from './storage';
 import { handler } from '../../netlify/functions/game';
 import { InternalRoom } from '../types/game';
 import type { HandlerEvent, HandlerContext, HandlerResponse } from '@netlify/functions';
@@ -54,26 +61,25 @@ function createMockEvent(overrides: Partial<HandlerEvent>): HandlerEvent {
 
 async function runTests() {
   console.log('================================================================');
-  console.log(' SECRET AGENT PRODUCTION MULTIPLAYER FIX VERIFICATION SUITE    ');
+  console.log(' SECRET AGENT PRODUCTION MULTIPLAYER STORAGE VERIFICATION SUITE ');
   console.log('================================================================\n');
 
-  console.log('--- TEST 1: Storage Environment Detection in Local Mode ---');
-  // When running locally, isProductionEnvironment() should return false
-  assert(!isProductionEnvironment(), 'Local test runner correctly detected as non-production');
-  console.log('Test 1 passed.\n');
+  console.log('--- TEST 1: Local Development Compatibility (No Credentials Required) ---');
+  // Confirm local mode detection
+  assert(!isProductionEnvironment(), 'Local test environment detected as non-production');
+  assert(!isNetlifyBlobsAvailable(), 'Netlify Blobs credentials absent in clean local environment');
 
-  console.log('--- TEST 2: Local Persistence & In-Memory Cache in Non-Production ---');
-  const testRoomCode = 'TSTFIX';
+  const localRoomCode = 'LOCDEV';
   const sampleRoom: InternalRoom = {
-    roomCode: testRoomCode,
-    roomId: `room_${testRoomCode}_123`,
+    roomCode: localRoomCode,
+    roomId: `room_${localRoomCode}_123`,
     hostPlayerId: 'op_test_1',
     gameMode: 'classic',
     status: 'WAITING',
     players: [
       {
         playerId: 'op_test_1',
-        displayName: 'AGENT_TEST',
+        displayName: 'LOCAL_AGENT',
         avatarId: 'falcon',
         sessionToken: 'sec_test_token_123',
         isHost: true,
@@ -88,101 +94,127 @@ async function runTests() {
     version: 0,
   };
 
+  // 1A. Room Creation & Immediate Authoritative Read
   const saveRes = await RoomStorage.saveRoom(sampleRoom, { onlyIfNew: true });
-  assert(saveRes.success, 'Sample room saved in local test environment');
+  assert(saveRes.success, 'Room created in local store without requiring credentials');
 
-  const { room: fetchedRoom } = await RoomStorage.getRoom(testRoomCode);
-  assert(fetchedRoom !== null, 'Room retrieved successfully');
-  assert(fetchedRoom?.roomCode === testRoomCode, 'Retrieved room code matches');
-  assert(fetchedRoom?.players.length === 1, 'Player roster preserved');
+  const { room: fetchedRoom } = await RoomStorage.getRoom(localRoomCode);
+  assert(fetchedRoom !== null, 'Room retrieved immediately after write');
+  assert(fetchedRoom?.roomCode === localRoomCode, 'Retrieved room code matches');
+  assert(fetchedRoom?.version === 1, 'Version incremented to 1');
 
-  // Verify duplicate room code collision rejection
+  // 1B. Duplicate Room-Code Rejection
   const dupRes = await RoomStorage.saveRoom(sampleRoom, { onlyIfNew: true });
   assert(!dupRes.success, 'Duplicate room code creation rejected');
-  assert(dupRes.error === 'Room code already exists', 'Returns Room code already exists error');
-  console.log('Test 2 passed.\n');
+  assert(dupRes.error === 'Room code already exists', 'Returns "Room code already exists" error');
 
-  console.log('--- TEST 3: Production Storage Protection (No Silent Fallback) ---');
-  // Temporarily simulate production environment without Netlify Blobs context
-  const originalNetlify = process.env.NETLIFY;
-  const originalBlobsContext = process.env.NETLIFY_BLOBS_CONTEXT;
-  delete process.env.NETLIFY_BLOBS_CONTEXT;
-  process.env.NETLIFY = 'true';
-
-  assert(isProductionEnvironment(), 'Simulated production environment detected');
-  assert(!isNetlifyBlobsAvailable(), 'Netlify Blobs context absent in simulated unconfigured production');
-
-  const prodRoom: InternalRoom = {
-    ...sampleRoom,
-    roomCode: 'PRODFX',
-    roomId: 'room_PRODFX_123',
-  };
-
-  const prodSaveRes = await RoomStorage.saveRoom(prodRoom);
-  assert(!prodSaveRes.success, 'Production save without Netlify Blobs fails explicitly');
+  // 1C. Concurrent Room Updates & Stale-Version Rejection
+  const staleUpdateRes = await RoomStorage.saveRoom(
+    { ...fetchedRoom!, status: 'DISCUSSION' },
+    { expectedVersion: 0 } // Expected version 0, but current is 1
+  );
+  assert(!staleUpdateRes.success, 'Stale-version update rejected');
   assert(
-    Boolean(
-      prodSaveRes.error?.includes('Production cloud storage is not available') ||
-        prodSaveRes.error?.includes('Netlify Blobs must be initialized')
-    ),
-    'Returns clear error message instead of silently writing to read-only disk'
+    staleUpdateRes.error === 'Concurrent room update conflict',
+    'Returns "Concurrent room update conflict" error'
   );
 
-  const { room: prodGetRoom } = await RoomStorage.getRoom('PRODFX');
-  assert(prodGetRoom === null, 'Production getRoom does not read local disk fallback when cloud storage is unavailable');
+  // Valid sequential update with correct expectedVersion
+  const validUpdateRes = await RoomStorage.saveRoom(
+    { ...fetchedRoom!, status: 'DISCUSSION' },
+    { expectedVersion: 1 }
+  );
+  assert(validUpdateRes.success, 'Sequential update with matching expectedVersion succeeds');
+  const { room: updatedRoom } = await RoomStorage.getRoom(localRoomCode);
+  assert(updatedRoom?.version === 2, 'Version updated to 2');
+  assert(updatedRoom?.status === 'DISCUSSION', 'Status updated to DISCUSSION');
 
-  // Restore environment
-  if (originalNetlify) {
-    process.env.NETLIFY = originalNetlify;
-  } else {
-    delete process.env.NETLIFY;
-  }
-  if (originalBlobsContext) {
-    process.env.NETLIFY_BLOBS_CONTEXT = originalBlobsContext;
-  }
+  // Clean up local room
+  await RoomStorage.deleteRoom(localRoomCode);
+  console.log('Test 1 passed.\n');
+
+  console.log('--- TEST 2: Missing Production Credentials Protection ---');
+  // Temporarily simulate Netlify production without environment variables
+  process.env.NETLIFY = 'true';
+  delete process.env.NETLIFY_SITE_ID;
+  delete process.env.SITE_ID;
+  delete process.env.NETLIFY_BLOBS_TOKEN;
+  delete process.env.NETLIFY_AUTH_TOKEN;
+
+  assert(isProductionEnvironment(), 'Simulated production environment active');
+  assert(!isNetlifyBlobsAvailable(), 'Netlify Blobs API credentials absent');
+
+  // Attempting to save in unconfigured production fails with actionable error
+  const unconfiguredSave = await RoomStorage.saveRoom(sampleRoom);
+  assert(!unconfiguredSave.success, 'Production save without credentials rejected');
+  assert(
+    Boolean(
+      unconfiguredSave.error?.includes('NETLIFY_SITE_ID') &&
+        unconfiguredSave.error?.includes('NETLIFY_BLOBS_TOKEN')
+    ),
+    'Returns clear actionable error specifying NETLIFY_SITE_ID and NETLIFY_BLOBS_TOKEN'
+  );
+
+  // Attempting to get in unconfigured production returns null (never reads local disk)
+  const { room: unconfiguredGet } = await RoomStorage.getRoom(localRoomCode);
+  assert(unconfiguredGet === null, 'Production getRoom never reads local disk when unconfigured');
+
+  // Function handler returns 503 STORAGE_CONFIG_ERROR
+  const mockPostEvent = createMockEvent({
+    httpMethod: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      action: 'CREATE_ROOM',
+      displayName: 'PROD_AGENT',
+      avatarId: 'falcon',
+      gameMode: 'classic',
+    }),
+  });
+  const handlerRes = (await handler(mockPostEvent, mockContext)) as HandlerResponse;
+  assert(handlerRes.statusCode === 503, 'Netlify Function returns 503 when credentials are unconfigured');
+  const handlerBody = JSON.parse(handlerRes.body || '{}');
+  assert(handlerBody.code === 'STORAGE_CONFIG_ERROR', 'Returns code STORAGE_CONFIG_ERROR');
+  assert(
+    Boolean(handlerBody.error?.includes('NETLIFY_SITE_ID') && handlerBody.error?.includes('NETLIFY_BLOBS_TOKEN')),
+    'Returns clear dashboard setup instructions in response body'
+  );
+
+  // Clean up production simulation
+  delete process.env.NETLIFY;
+  console.log('Test 2 passed.\n');
+
+  console.log('--- TEST 3: Strong-Consistency API Access Configuration ---');
+  // Set mock Netlify Blobs API credentials
+  process.env.NETLIFY_SITE_ID = 'site_mock_12345';
+  process.env.NETLIFY_BLOBS_TOKEN = 'nfp_mock_token_67890';
+
+  assert(isNetlifyBlobsAvailable(), 'isNetlifyBlobsAvailable() is true when credentials are set');
+
+  const apiStore = getNetlifyStore();
+  // Inspect internal client options constructed by @netlify/blobs
+  const client = (apiStore as unknown as { client: { edgeAccess: boolean; edgeURL?: string; siteID: string } }).client;
+
+  assert(client.edgeAccess === false, 'edgeAccess is false (routes to API, not edge)');
+  assert(client.edgeURL === undefined, 'edgeURL is undefined (bypasses CDN edge caching)');
+  assert(client.siteID === 'site_mock_12345', 'Site ID matches configured NETLIFY_SITE_ID');
+
+  // Clean up
+  delete process.env.NETLIFY_SITE_ID;
+  delete process.env.NETLIFY_BLOBS_TOKEN;
   console.log('Test 3 passed.\n');
 
-  console.log('--- TEST 4: Netlify Function Handler - OPTIONS & CORS Headers ---');
-  const optionsEvent = createMockEvent({
-    httpMethod: 'OPTIONS',
-    headers: {},
-  });
+  console.log('--- TEST 4: Options Preflight & CORS Support ---');
+  const optionsEvent = createMockEvent({ httpMethod: 'OPTIONS' });
   const optionsRes = (await handler(optionsEvent, mockContext)) as HandlerResponse;
-  assert(optionsRes.statusCode === 204, 'OPTIONS preflight returns 204');
+  assert(optionsRes.statusCode === 204, 'OPTIONS preflight returns 204 No Content');
   assert(
     Boolean(optionsRes.headers && optionsRes.headers['Access-Control-Allow-Origin'] === '*'),
-    'CORS origin header present'
+    'CORS header Access-Control-Allow-Origin: * present'
   );
   console.log('Test 4 passed.\n');
 
-  console.log('--- TEST 5: Netlify Function Handler - Production Guard without Blobs ---');
-  process.env.NETLIFY = 'true';
-  delete process.env.NETLIFY_BLOBS_CONTEXT;
-  delete (globalThis as Record<string, unknown>).netlifyBlobsContext;
-
-  const postEventWithoutBlobs = createMockEvent({
-    httpMethod: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'CREATE_ROOM', displayName: 'FAIL_AGENT', avatarId: 'falcon', gameMode: 'classic' }),
-  });
-  const failRes = (await handler(postEventWithoutBlobs, mockContext)) as HandlerResponse;
-  assert(failRes.statusCode === 503, 'Handler returns 503 when Blobs context is missing in production');
-  const failBody = JSON.parse(failRes.body || '{}');
-  assert(failBody.code === 'STORAGE_UNAVAILABLE', 'Returns STORAGE_UNAVAILABLE code');
-
-  // Clean up
-  delete process.env.NETLIFY;
-  console.log('Test 5 passed.\n');
-
-  console.log('--- TEST 6: Room Deletion & Cache Invalidation ---');
-  const deleteRes = await RoomStorage.deleteRoom(testRoomCode);
-  assert(deleteRes, 'Room deleted successfully');
-  const { room: afterDelete } = await RoomStorage.getRoom(testRoomCode);
-  assert(afterDelete === null, 'Room lookup after deletion returns null');
-  console.log('Test 6 passed.\n');
-
   console.log('================================================================');
-  console.log(' ALL PRODUCTION MULTIPLAYER FIX TESTS PASSED (6/6)!             ');
+  console.log(' ALL PRODUCTION MULTIPLAYER STORAGE TESTS PASSED (4/4)!         ');
   console.log('================================================================\n');
 }
 

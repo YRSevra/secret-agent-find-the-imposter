@@ -12,18 +12,6 @@ interface LocalStoreData {
 }
 
 /**
- * In-memory serverless runtime cache (safe across warm invocations).
- * Short TTL (1.5s) prevents stale reads across concurrent instances.
- */
-interface CacheEntry {
-  room: InternalRoom;
-  version: number;
-  cachedAt: number;
-}
-const memoryCache = new Map<string, CacheEntry>();
-const CACHE_TTL_MS = 1500;
-
-/**
  * Check if the runtime is Netlify Production (or AWS Lambda).
  */
 export function isProductionEnvironment(): boolean {
@@ -31,27 +19,40 @@ export function isProductionEnvironment(): boolean {
 }
 
 /**
- * Check if Netlify Blobs runtime environment is available.
+ * Check if Netlify Blobs API access credentials (Site ID and Personal Access Token)
+ * are configured for strong-consistency origin storage access.
  */
 export function isNetlifyBlobsAvailable(): boolean {
-  if (typeof globalThis.netlifyBlobsContext !== 'undefined') return true;
-  if (process.env.NETLIFY_BLOBS_CONTEXT) return true;
-  if (process.env.NETLIFY_SITE_ID && process.env.NETLIFY_BLOBS_TOKEN) return true;
-  return false;
+  const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
+  const token = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+  return Boolean(siteID && token);
 }
 
 /**
- * Get Netlify Blobs store instance with strong consistency.
+ * Get Netlify Blobs store instance using documented API-access configuration.
+ * Connecting via siteID and token routes directly to the origin database (https://api.netlify.com/api/v1/blobs),
+ * which guarantees origin-backed strong consistency without relying on edge caching or uncachedEdgeURL.
  */
-function getNetlifyStore() {
-  const options: { name: string; consistency: 'strong'; siteID?: string; token?: string } = {
-    name: STORE_NAME,
-    consistency: 'strong',
-  };
-  if (process.env.NETLIFY_SITE_ID && process.env.NETLIFY_BLOBS_TOKEN) {
-    options.siteID = process.env.NETLIFY_SITE_ID;
-    options.token = process.env.NETLIFY_BLOBS_TOKEN;
+export function getNetlifyStore() {
+  const siteID = process.env.NETLIFY_SITE_ID || process.env.SITE_ID;
+  const token = process.env.NETLIFY_BLOBS_TOKEN || process.env.NETLIFY_AUTH_TOKEN;
+  const apiURL = process.env.NETLIFY_API_URL;
+
+  if (!siteID || !token) {
+    throw new Error(
+      'Netlify Blobs API access requires NETLIFY_SITE_ID and NETLIFY_BLOBS_TOKEN environment variables.'
+    );
   }
+
+  const options: { name: string; siteID: string; token: string; apiURL?: string } = {
+    name: STORE_NAME,
+    siteID,
+    token,
+  };
+  if (apiURL) {
+    options.apiURL = apiURL;
+  }
+
   return getStore(options);
 }
 
@@ -86,43 +87,37 @@ function writeLocalStore(data: LocalStoreData): void {
 
 export class RoomStorage {
   /**
-   * Retrieve a room by its 6-character code with strong consistency.
+   * Retrieve a room by its 6-character code directly from authoritative storage.
+   * Note: In-memory cache is intentionally omitted to guarantee fresh cross-player synchronization.
    */
-  static async getRoom(roomCode: string): Promise<{ room: InternalRoom | null; version?: number }> {
+  static async getRoom(
+    roomCode: string
+  ): Promise<{ room: InternalRoom | null; version?: number; etag?: string }> {
     const key = `room_${roomCode.toUpperCase()}`;
 
-    // 1. Check warm serverless memory cache first
-    const cached = memoryCache.get(key);
-    if (cached && Date.now() - cached.cachedAt < CACHE_TTL_MS) {
-      return { room: cached.room, version: cached.version };
-    }
-
-    // 2. Fetch from Netlify Blobs if context is available
+    // 1. Fetch from Netlify Blobs if API credentials are configured
     if (isNetlifyBlobsAvailable()) {
       try {
         const store = getNetlifyStore();
-        const res = await store.getWithMetadata(key, { consistency: 'strong', type: 'json' });
+        const res = await store.getWithMetadata(key, { type: 'json' });
         if (!res || !res.data) {
-          memoryCache.delete(key);
           return { room: null };
         }
         const room = res.data as InternalRoom;
         const version = typeof res.metadata?.version === 'number' ? res.metadata.version : room.version;
-        memoryCache.set(key, { room, version, cachedAt: Date.now() });
-        return { room, version };
+        return { room, version, etag: res.etag };
       } catch (err) {
         console.error('Netlify Blobs getRoom error:', err);
-        // In production, do NOT read from local disk
         if (isProductionEnvironment()) {
           return { room: null };
         }
       }
     } else if (isProductionEnvironment()) {
-      // In production, if Blobs is not available, do NOT read from local disk
+      // In production without configured API credentials, NEVER read from local disk
       return { room: null };
     }
 
-    // 3. Local fallback (only for local development & unit test runs)
+    // 2. Local fallback (only for local development & unit test runs)
     const local = readLocalStore();
     const entry = local.rooms[key];
     if (!entry) return { room: null };
@@ -130,9 +125,9 @@ export class RoomStorage {
   }
 
   /**
-   * Save a room with conditional write support:
-   * - onlyIfNew: prevents room code collisions on creation
-   * - expectedVersion: prevents concurrent overwrite / capacity races
+   * Save a room with strict conditional write support:
+   * - onlyIfNew: atomic CAS rejection if room code already exists on the storage server
+   * - expectedVersion: ETag-based optimistic concurrency rejection if modified concurrently
    */
   static async saveRoom(
     room: InternalRoom,
@@ -149,42 +144,55 @@ export class RoomStorage {
     if (isNetlifyBlobsAvailable()) {
       try {
         const store = getNetlifyStore();
+
+        // A. Room Creation: Atomic uniqueness via onlyIfNew (if-none-match: *)
         if (options?.onlyIfNew) {
-          // Check if key already exists in Netlify Blobs with strong consistency
-          const existing = await store.get(key, { consistency: 'strong' });
-          if (existing) {
+          const writeRes = await store.setJSON(key, roomToSave, {
+            onlyIfNew: true,
+            metadata: { version: nextVersion, roomCode: room.roomCode },
+          });
+          if (writeRes && 'modified' in writeRes && writeRes.modified === false) {
             return { success: false, error: 'Room code already exists' };
           }
+          return { success: true };
         }
 
+        // B. Room Update: Version verification and atomic ETag conditional write (if-match)
         if (typeof options?.expectedVersion === 'number') {
-          const current = await store.getWithMetadata(key, { consistency: 'strong', type: 'json' });
-          if (current && current.metadata?.version !== options.expectedVersion) {
+          const current = await store.getWithMetadata(key, { type: 'json' });
+          if (!current || !current.data) {
+            return { success: false, error: 'Room does not exist' };
+          }
+
+          const currentVersion =
+            typeof current.metadata?.version === 'number'
+              ? current.metadata.version
+              : (current.data as InternalRoom).version;
+
+          if (currentVersion !== options.expectedVersion) {
             return { success: false, error: 'Concurrent room update conflict' };
           }
+
+          // Atomic ETag conditional write: rejects if another write succeeded in the interim
+          const writeRes = await store.setJSON(key, roomToSave, {
+            onlyIfMatch: current.etag,
+            metadata: { version: nextVersion, roomCode: room.roomCode },
+          });
+
+          if (writeRes && 'modified' in writeRes && writeRes.modified === false) {
+            return { success: false, error: 'Concurrent room update conflict' };
+          }
+
+          return { success: true };
         }
 
-        const setOpts: {
-          metadata: { version: number; roomCode: string };
-          onlyIfNew?: boolean;
-        } = {
+        // C. Unconditional write (initialization/admin reset)
+        await store.setJSON(key, roomToSave, {
           metadata: { version: nextVersion, roomCode: room.roomCode },
-        };
-        if (options?.onlyIfNew) {
-          setOpts.onlyIfNew = true;
-        }
-
-        const writeRes = await store.setJSON(key, roomToSave, setOpts);
-        if (options?.onlyIfNew && writeRes && 'modified' in writeRes && writeRes.modified === false) {
-          return { success: false, error: 'Room code already exists' };
-        }
-
-        // Keep local memory cache synchronized
-        memoryCache.set(key, { room: roomToSave, version: nextVersion, cachedAt: Date.now() });
+        });
         return { success: true };
       } catch (err) {
         console.error('Netlify Blobs saveRoom error:', err);
-        // In production, fail explicitly. NEVER silently fall back to local read-only disk!
         if (isProductionEnvironment()) {
           return {
             success: false,
@@ -193,10 +201,10 @@ export class RoomStorage {
         }
       }
     } else if (isProductionEnvironment()) {
-      // In production without Blobs, fail explicitly
       return {
         success: false,
-        error: 'Production cloud storage is not available. Netlify Blobs must be initialized.',
+        error:
+          'Production cloud storage is unconfigured. Netlify Site ID (NETLIFY_SITE_ID) and Personal Access Token (NETLIFY_BLOBS_TOKEN) must be configured in Netlify environment variables.',
       };
     }
 
@@ -220,7 +228,6 @@ export class RoomStorage {
       updatedAt: roomToSave.updatedAt,
     };
     writeLocalStore(local);
-    memoryCache.set(key, { room: roomToSave, version: nextVersion, cachedAt: Date.now() });
     return { success: true };
   }
 
@@ -229,7 +236,6 @@ export class RoomStorage {
    */
   static async deleteRoom(roomCode: string): Promise<boolean> {
     const key = `room_${roomCode.toUpperCase()}`;
-    memoryCache.delete(key);
 
     if (isNetlifyBlobsAvailable()) {
       try {

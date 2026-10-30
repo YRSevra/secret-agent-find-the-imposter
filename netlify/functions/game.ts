@@ -1,6 +1,6 @@
 import type { Handler } from '@netlify/functions';
-import { connectLambda } from '@netlify/blobs';
 import { RoomManager } from '../../src/server/roomManager';
+import { isProductionEnvironment, isNetlifyBlobsAvailable } from '../../src/server/storage';
 import { GameApiRequest } from '../../src/types/game';
 
 const HEADERS = {
@@ -19,30 +19,20 @@ export const handler: Handler = async (event) => {
     };
   }
 
-  // 1. Initialize Netlify Blobs Lambda context from the execution event
-  const lambdaEvent = event as unknown as { blobs?: string; headers: Record<string, string> };
-  if (lambdaEvent.blobs) {
-    try {
-      connectLambda({ blobs: lambdaEvent.blobs, headers: lambdaEvent.headers || {} });
-    } catch (err) {
-      console.error('[CRITICAL] Netlify Blobs connectLambda failed:', err);
-    }
-  }
-
-  // Check if running on Netlify production where Blobs context is required
-  const isNetlifyProduction = process.env.NETLIFY === 'true' || Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
-  const isBlobsConfigured =
-    typeof globalThis.netlifyBlobsContext !== 'undefined' || Boolean(process.env.NETLIFY_BLOBS_CONTEXT);
-
-  if (isNetlifyProduction && !isBlobsConfigured) {
-    console.error('[CRITICAL] Netlify production environment detected without active Blobs context.');
+  // 1. Guard production environment: verify strong-consistency API access credentials
+  if (isProductionEnvironment() && !isNetlifyBlobsAvailable()) {
+    console.error(
+      '[CRITICAL] Netlify production environment detected without strong-consistency API credentials. ' +
+        'NETLIFY_SITE_ID and NETLIFY_BLOBS_TOKEN must be configured in Netlify Site Environment Variables.'
+    );
     return {
       statusCode: 503,
       headers: HEADERS,
       body: JSON.stringify({
         success: false,
-        error: 'Agency cloud storage subsystem unavailable. Netlify Blobs context failed to initialize.',
-        code: 'STORAGE_UNAVAILABLE',
+        error:
+          'Agency production cloud storage is unconfigured. Netlify Site ID (NETLIFY_SITE_ID) and Personal Access Token (NETLIFY_BLOBS_TOKEN) must be configured in Netlify environment variables.',
+        code: 'STORAGE_CONFIG_ERROR',
       }),
     };
   }
@@ -67,7 +57,7 @@ export const handler: Handler = async (event) => {
     if (!response.success) {
       if (response.code === 'ROOM_NOT_FOUND') statusCode = 404;
       else if (response.code === 'UNAUTHORIZED') statusCode = 401;
-      else if (response.code === 'STORAGE_UNAVAILABLE') statusCode = 503;
+      else if (response.code === 'STORAGE_UNAVAILABLE' || response.code === 'STORAGE_CONFIG_ERROR') statusCode = 503;
       else statusCode = 400;
     }
 
